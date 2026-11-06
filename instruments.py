@@ -512,15 +512,28 @@ class DMM6500:
         self._configured = False
 
 
-def probe_links(smu_host: str, dmm_host: str) -> str:
-    """Read identities and present states without changing either instrument."""
+def probe_links(smu_host: str, dmm_host: str | None = None) -> str:
+    """Read connected instrument states without changing either instrument.
+
+    Omit ``dmm_host`` in no-reference mode so no DMM object or VISA session is
+    created, even when the meter is disconnected.
+    """
     smu = Keithley2634B(smu_host, timeout_s=3)
-    dmm = DMM6500(dmm_host, timeout_s=3)
+    dmm: DMM6500 | None = None
     try:
         smu_id = smu.connect()
         smu_outputs = _tsp_fields(smu.io.query(
             "print(smua.source.output, smub.source.output)"
         ), 2)
+        summary = (
+            f"Keithley 2634B: {smu_id}\n"
+            f"SMU outputs (drain/gate): {smu_outputs[0]}/{smu_outputs[1]} "
+            "(0=off, 1=on)"
+        )
+        if dmm_host is None:
+            return summary
+
+        dmm = DMM6500(dmm_host, timeout_s=3)
         dmm_id = dmm.connect()
         language = dmm.io.query("*LANG?").strip()
         if language.upper() == "SCPI":
@@ -530,13 +543,12 @@ def probe_links(smu_host: str, dmm_host: str) -> str:
             terminals = "unavailable until SCPI is selected"
             impedance = "unavailable until SCPI is selected"
         return (
-            f"Keithley 2634B: {smu_id}\n"
-            f"SMU outputs (drain/gate): {smu_outputs[0]}/{smu_outputs[1]} "
-            "(0=off, 1=on)\n"
+            f"{summary}\n"
             f"DMM6500: {dmm_id}\n"
             f"DMM command set: {language}; terminals: {terminals}; "
             f"DCV input impedance: {impedance}"
         )
     finally:
-        dmm.close()
+        if dmm is not None:
+            dmm.close()
         smu.close()

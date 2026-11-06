@@ -1,9 +1,8 @@
-"""Single-OECT acquisition with a separate, high-impedance reference probe.
+"""Single-OECT acquisition with optional high-impedance reference sensing.
 
 The 2634B current readings are requested from smua and smub in one TSP query;
-the DMM6500 reference reading follows over LAN. They are not hardware
-simultaneous, and each row contains source setpoints rather than measured
-source voltages.
+when selected, the DMM6500 reference reading follows over LAN. These readings
+are not hardware simultaneous. Voltage columns are source setpoints.
 """
 
 from __future__ import annotations
@@ -25,7 +24,7 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
-# GateV and DrainV are verified source setpoints; Vref is the DMM reading.
+# GateV and DrainV are verified source setpoints; Vref is blank without a DMM.
 FIELDS = ("Time", "GateI", "GateV", "DrainI", "DrainV", "Vref")
 
 
@@ -57,7 +56,7 @@ class RawDataWriter:
             self._num(sample.gate_v),
             self._num(sample.drain_i_a),
             self._num(sample.drain_v),
-            self._num(sample.vref_v),
+            self._num(sample.vref_v) if sample.vref_v is not None else "",
         ))
         self._file.flush()  # preserve each reading even if a long run is interrupted
         self.samples += 1
@@ -103,7 +102,9 @@ class SimulatedSMU:
         if wait > timeout_s:
             raise TimeoutError("Simulated current sample timed out")
         if wait > 0:
-            if stop_event is not None and stop_event.wait(wait):
+            if stop_event is None:
+                time.sleep(wait)
+            elif stop_event.wait(wait):
                 raise InterruptedError("Measurement stopped during the read interval")
         elapsed = time.monotonic() - self.started
         index = max(self.last_index + 1, int(elapsed / self.interval_s))
@@ -167,10 +168,10 @@ def run_experiment(
     on_status: Callable[[str], None] | None = None,
     stop_event: threading.Event | None = None,
 ) -> RunResult:
-    """Run an Eref target staircase using bounded gate-voltage feedback.
+    """Run an Eref target or open-loop Vg sweep with optional DMM sensing.
 
-    Eref uses the DMM Vref sign: V(reference)−V(source). The selected response
-    direction determines which gate adjustment reduces the target error.
+    Feedback uses Eref = V(reference)−V(source); monitor and no-reference
+    modes use the sweep levels as direct Vg setpoints.
     """
     config.validate()
     stop = stop_event or threading.Event()
@@ -180,21 +181,23 @@ def run_experiment(
     smu = SimulatedSMU(config.sample_interval_s, config.feedback_polarity) if config.simulation else Keithley2634B(
         config.smu_ip, timeout_s=10.0
     )
-    dmm = SimulatedDMM(smu) if config.simulation else DMM6500(
-        config.dmm_ip, timeout_s=10.0
+    dmm = None if config.reference_mode == "none" else (
+        SimulatedDMM(smu) if config.simulation else DMM6500(config.dmm_ip, timeout_s=10.0)
     )
     writer: RawDataWriter | None = None
     started: float | None = None
-    gate_v = config.gate_initial_v
+    levels = config.levels
+    gate_v = config.gate_initial_v if config.reference_mode == "feedback" else levels[0]
     saturated_count = 0
     stopped = False
     failure: Exception | None = None
     try:
-        # Verify the high-impedance meter before enabling either SMU output.
-        status("Connecting DMM6500 and verifying high-impedance DC voltage mode")
-        dmm_id = dmm.connect()
-        dmm.configure()
-        status(f"DMM ready: {dmm_id}")
+        # When used, verify the high-impedance meter before enabling SMU output.
+        if dmm is not None:
+            status("Connecting DMM6500 and verifying high-impedance DC voltage mode")
+            dmm_id = dmm.connect()
+            dmm.configure()
+            status(f"DMM ready: {dmm_id}")
         if stop.is_set():
             return RunResult(config.output_path, 0, True)
 
@@ -208,10 +211,10 @@ def run_experiment(
         status("Starting OECT acquisition")
         smu.start()
         started = time.monotonic()
-        levels = config.levels
         stage_index = 0
         stage_start = started
-        stage_end = stage_start + config.hold_s + (config.final_keep_s if len(levels) == 1 else 0)
+        final_keep_s = config.final_keep_s if config.sweep_mode == "staircase" else 0.0
+        stage_end = stage_start + config.hold_s + (final_keep_s if len(levels) == 1 else 0.0)
         last_target = levels[0]
         stage_has_sample = False
         while not stop.is_set():
@@ -220,15 +223,21 @@ def run_experiment(
                 if stage_index + 1 >= len(levels):
                     break
                 stage_index += 1
-                stage_start = now
+                last_target = levels[stage_index]
+                if config.reference_mode != "feedback":
+                    # Open-loop stages command Vg once, before their first read.
+                    gate_v = smu.set_gate(last_target)
+                stage_start = time.monotonic()
                 stage_end = stage_start + config.hold_s
                 if stage_index + 1 == len(levels):
-                    stage_end += config.final_keep_s
-                last_target = levels[stage_index]
+                    stage_end += final_keep_s
                 stage_has_sample = False
                 saturated_count = 0
-                status(f"Level {stage_index + 1}/{len(levels)}: "
-                       f"target Eref {last_target:+.4f} V")
+                quantity = "target Eref" if config.reference_mode == "feedback" else "Vg"
+                cycle_text = (f" • cycle {config.cycle_for_stage(stage_index + 1)}/"
+                              f"{config.cycle_count}" if config.sweep_mode == "cycles" else "")
+                status(f"Level {stage_index + 1}/{len(levels)}{cycle_text}: "
+                       f"{quantity} {last_target:+.4f} V")
 
             try:
                 pair = smu.read_next(timeout_s=config.sample_interval_s + 10.0,
@@ -239,15 +248,17 @@ def run_experiment(
             if stop.is_set():
                 stopped = True
                 break
-            vref = dmm.read_vref()
-            dmm_time = utc_now()
-            if not math.isfinite(vref) or abs(vref) > 10:
+            vref = dmm.read_vref() if dmm is not None else None
+            dmm_time = utc_now() if dmm is not None else None
+            if stop.is_set():
+                stopped = True
+                break
+            if vref is not None and (not math.isfinite(vref) or abs(vref) > 10):
                 raise ValueError(f"DMM returned invalid Vref={vref!r}")
-            e_reference = vref
             now = time.monotonic()
             elapsed = now - started
             stage_age = now - stage_start
-            if stage_index + 1 == len(levels) and stage_age >= config.hold_s:
+            if final_keep_s and stage_index + 1 == len(levels) and stage_age >= config.hold_s:
                 phase = "final_keep"
             elif stage_age < config.delay_s:
                 phase = "settling"
@@ -257,27 +268,33 @@ def run_experiment(
                 utc=utc_now(), elapsed_s=elapsed, stage_index=stage_index + 1,
                 phase=phase, target_v=last_target, gate_i_a=pair.gate_i_a,
                 gate_v=gate_v, drain_i_a=pair.drain_i_a, drain_v=config.vds_v,
-                vref_v=vref, e_reference_v=e_reference,
+                vref_v=vref, e_reference_v=vref,
                 smu_index=pair.index,
                 smu_nominal_elapsed_s=pair.nominal_elapsed_s,
                 smu_skipped=pair.skipped, dmm_read_utc=dmm_time,
-                within_tolerance=abs(last_target - e_reference) <= config.feedback_tolerance_v,
+                within_tolerance=(abs(last_target - vref) <= config.feedback_tolerance_v
+                                  if config.reference_mode == "feedback" and vref is not None else None),
+                cycle_index=config.cycle_for_stage(stage_index + 1),
             )
             writer.write(sample)
             stage_has_sample = True
             report(sample)
-            new_gate_v = next_feedback_gate(gate_v, last_target,
-                                            e_reference, config)
-            if not math.isclose(new_gate_v, gate_v, abs_tol=1e-12):
-                gate_v = smu.set_gate(new_gate_v)
-            at_limit = (math.isclose(gate_v, config.gate_min_v, abs_tol=1e-8) or
-                        math.isclose(gate_v, config.gate_max_v, abs_tol=1e-8))
-            if at_limit and abs(last_target - e_reference) > max(0.05, 2 * config.feedback_tolerance_v):
-                saturated_count += 1
-                if saturated_count >= 10:
-                    raise RuntimeError("Feedback could not reach target before the gate limit; outputs stopped")
-            else:
-                saturated_count = 0
+            if stop.is_set():
+                stopped = True
+                break
+            if config.reference_mode == "feedback":
+                assert vref is not None
+                new_gate_v = next_feedback_gate(gate_v, last_target, vref, config)
+                if not math.isclose(new_gate_v, gate_v, abs_tol=1e-12):
+                    gate_v = smu.set_gate(new_gate_v)
+                at_limit = (math.isclose(gate_v, config.gate_min_v, abs_tol=1e-8) or
+                            math.isclose(gate_v, config.gate_max_v, abs_tol=1e-8))
+                if at_limit and abs(last_target - vref) > max(0.05, 2 * config.feedback_tolerance_v):
+                    saturated_count += 1
+                    if saturated_count >= 10:
+                        raise RuntimeError("Feedback could not reach target before the gate limit; outputs stopped")
+                else:
+                    saturated_count = 0
         stopped = stopped or stop.is_set()
         return RunResult(config.output_path, writer.samples, stopped)
     except Exception as exc:
@@ -290,10 +307,11 @@ def run_experiment(
             smu.shutdown()
         except Exception as cleanup_exc:
             cleanup_errors.append(f"2634B shutdown could not be verified: {cleanup_exc}")
-        try:
-            dmm.close()
-        except Exception as cleanup_exc:
-            cleanup_errors.append(f"DMM close failed: {cleanup_exc}")
+        if dmm is not None:
+            try:
+                dmm.close()
+            except Exception as cleanup_exc:
+                cleanup_errors.append(f"DMM close failed: {cleanup_exc}")
         if writer is not None:
             try:
                 writer.close()

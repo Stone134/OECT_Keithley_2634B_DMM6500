@@ -294,6 +294,19 @@ class DriverTests(unittest.TestCase):
         self.assertFalse(smu_io.connected)
         self.assertFalse(dmm_io.connected)
 
+    def test_probe_without_reference_never_creates_dmm(self) -> None:
+        smu_io = FakeSMUIO()
+        with patch.object(instruments, "_VisaTransport", return_value=smu_io), patch.object(
+            instruments, "DMM6500", side_effect=AssertionError("DMM must not be created")
+        ):
+            summary = instruments.probe_links("192.168.1.150")
+        self.assertIn("Keithley 2634B", summary)
+        self.assertIn("SMU outputs", summary)
+        self.assertNotIn("DMM", summary)
+        self.assertEqual(smu_io.queries, ["*IDN?", "print(smua.source.output, smub.source.output)"])
+        self.assertEqual(smu_io.writes, [])
+        self.assertFalse(smu_io.connected)
+
     def test_probe_reports_non_scpi_meter_without_sending_scpi_queries(self) -> None:
         smu_io, dmm_io = FakeSMUIO(), FakeDMMIO()
         dmm_io.language = "TSP"

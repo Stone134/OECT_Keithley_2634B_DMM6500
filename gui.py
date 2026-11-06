@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Desktop front panel for a 2634B-driven OECT with a DMM6500 reference input."""
+"""Desktop front panel for 2634B OECT sweeps with optional DMM6500 sensing."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from models import RunConfig, Sample
 from runner import run_experiment
 
 
-APP_TITLE = "OECT with reference"
+APP_TITLE = "OECT measurement"
 PROJECT_DIR = Path(__file__).resolve().parent
 
 
@@ -70,7 +70,7 @@ class ConnectionWorker(QtCore.QThread):
     probe_complete = QtCore.pyqtSignal(bool, str)
 
     def __init__(
-        self, smu_host: str, dmm_host: str, parent: QtCore.QObject | None = None
+        self, smu_host: str, dmm_host: str | None, parent: QtCore.QObject | None = None
     ) -> None:
         super().__init__(parent)
         self.smu_host = smu_host
@@ -120,6 +120,8 @@ class OECTWindow(QtWidgets.QMainWindow):
         self._pending_close = False
         self._sample_count = 0
         self._duration_s = 1.0
+        self._active_reference_mode = "feedback"
+        self._active_sweep_mode = "staircase"
         self._plot_data: dict[str, list[float]] = {
             "time": [], "id": [], "vg": [], "vref": [], "target_ref": [],
         }
@@ -149,10 +151,10 @@ class OECTWindow(QtWidgets.QMainWindow):
         title_box = QtWidgets.QVBoxLayout()
         title = QtWidgets.QLabel(APP_TITLE)
         title.setObjectName("title")
-        subtitle = QtWidgets.QLabel("Keithley 2634B • smua drain / smub gate  |  DMM6500 • Reference voltage")
-        subtitle.setProperty("muted", True)
+        self.subtitle = QtWidgets.QLabel("Keithley 2634B • smua drain / smub gate  |  DMM6500 • Reference voltage")
+        self.subtitle.setProperty("muted", True)
         title_box.addWidget(title)
-        title_box.addWidget(subtitle)
+        title_box.addWidget(self.subtitle)
         layout.addLayout(title_box, 1)
         self.mode_badge = QtWidgets.QLabel("SIMULATION")
         self.mode_badge.setObjectName("modeBadge")
@@ -213,29 +215,43 @@ class OECTWindow(QtWidgets.QMainWindow):
         self.simulation.toggled.connect(self._simulation_changed)
         grid.addWidget(self.simulation, 0, 0, 1, 4)
 
+        self.reference_mode = QtWidgets.QComboBox()
+        self.reference_mode.addItem("Reference feedback • DMM controls Vg", "feedback")
+        self.reference_mode.addItem("Reference monitor • DMM reads Vref only", "monitor")
+        self.reference_mode.addItem("No reference • 2634B only", "none")
+        self.reference_mode.currentIndexChanged.connect(self._reference_mode_changed)
+        grid.addWidget(QtWidgets.QLabel("Reference mode"), 1, 0)
+        grid.addWidget(self.reference_mode, 1, 1, 1, 3)
+
         self.smu_ip = QtWidgets.QLineEdit(RunConfig.smu_ip)
         self.dmm_ip = QtWidgets.QLineEdit(RunConfig.dmm_ip)
-        grid.addWidget(QtWidgets.QLabel("2634B IP"), 1, 0)
-        grid.addWidget(self.smu_ip, 1, 1)
-        grid.addWidget(QtWidgets.QLabel("DMM6500 IP"), 1, 2)
-        grid.addWidget(self.dmm_ip, 1, 3)
+        self.dmm_ip_label = QtWidgets.QLabel("DMM6500 IP")
+        grid.addWidget(QtWidgets.QLabel("2634B IP"), 2, 0)
+        grid.addWidget(self.smu_ip, 2, 1)
+        grid.addWidget(self.dmm_ip_label, 2, 2)
+        grid.addWidget(self.dmm_ip, 2, 3)
         self.test_button = QtWidgets.QPushButton("Test both connections")
         self.test_button.setProperty("secondary", True)
         self.test_button.clicked.connect(self._test_connections)
-        grid.addWidget(self.test_button, 2, 0, 1, 4)
-        visa_note = QtWidgets.QLabel("VISA LAN: TCPIP0::IP::inst0::INSTR for both instruments")
-        visa_note.setProperty("muted", True)
-        visa_note.setWordWrap(True)
-        grid.addWidget(visa_note, 3, 0, 1, 4)
-        note = QtWidgets.QLabel("DMM front INPUT HI → Reference  •  INPUT LO → OECT source")
-        note.setProperty("muted", True)
-        note.setWordWrap(True)
-        grid.addWidget(note, 4, 0, 1, 4)
+        grid.addWidget(self.test_button, 3, 0, 1, 4)
+        self.visa_note = QtWidgets.QLabel("VISA LAN: TCPIP0::IP::inst0::INSTR for both instruments")
+        self.visa_note.setProperty("muted", True)
+        self.visa_note.setWordWrap(True)
+        grid.addWidget(self.visa_note, 4, 0, 1, 4)
+        self.reference_wiring_note = QtWidgets.QLabel("DMM front INPUT HI → Reference  •  INPUT LO → OECT source")
+        self.reference_wiring_note.setProperty("muted", True)
+        self.reference_wiring_note.setWordWrap(True)
+        grid.addWidget(self.reference_wiring_note, 5, 0, 1, 4)
         return group
 
     def _sweep_card(self) -> QtWidgets.QWidget:
         self.sweep_group, grid = self._group_grid("Target Eref sweep")
         defaults = RunConfig()
+        self.sweep_mode = QtWidgets.QComboBox()
+        self.sweep_mode.addItem("Staircase • keep at final", "staircase")
+        self.sweep_mode.addItem("Back and forth • cycles", "cycles")
+        self.sweep_mode.currentIndexChanged.connect(self._sweep_mode_changed)
+        grid.addWidget(self._row_field(QtWidgets.QLabel("Pattern"), self.sweep_mode), 0, 0, 1, 2)
         self.vds = spin(-3, 3, defaults.vds_v, 0.01, 4, " V")
         self.sweep_start = spin(-3, 3, defaults.sweep_start_v, 0.1, 4, " V")
         self.sweep_stop = spin(-3, 3, defaults.sweep_stop_v, 0.1, 4, " V")
@@ -244,6 +260,11 @@ class OECTWindow(QtWidgets.QMainWindow):
         self.delay = spin(0, 999_999, defaults.delay_s, 0.1, 3, " s")
         self.final_keep = spin(0, 1_000_000, defaults.final_keep_s, 60, 3, " s")
         self.interval = spin(0.1, 60, defaults.sample_interval_s, 0.1, 3, " s")
+        self.cycle_count = QtWidgets.QSpinBox()
+        self.cycle_count.setRange(1, 1000)
+        self.cycle_count.setValue(defaults.cycle_count)
+        self.cycle_count.setMinimumWidth(112)
+        self.cycle_count.setKeyboardTracking(False)
         self.start_label = QtWidgets.QLabel("Eref initial")
         self.stop_label = QtWidgets.QLabel("Eref final")
         self.step_label = QtWidgets.QLabel("Eref step")
@@ -253,17 +274,19 @@ class OECTWindow(QtWidgets.QMainWindow):
             ((self.stop_label, self.sweep_stop), (QtWidgets.QLabel("Keep at final"), self.final_keep)),
             ((self.step_label, self.sweep_step), (QtWidgets.QLabel("Read interval"), self.interval)),
         )
-        for row, pair in enumerate(fields):
+        for row, pair in enumerate(fields, start=1):
             for column, (caption, control) in enumerate(pair):
                 grid.addWidget(self._row_field(caption, control), row, column)
-        note = QtWidgets.QLabel("Delay is inside each period. Drain and gate current limits: 0.003 A each.")
-        note.setProperty("muted", True)
-        note.setWordWrap(True)
-        grid.addWidget(note, len(fields), 0, 1, 2)
+        grid.addWidget(self._row_field(QtWidgets.QLabel("Cycles"), self.cycle_count), len(fields) + 1, 0)
+        self.sweep_note = QtWidgets.QLabel("Delay is inside each period. Drain and gate current limits: 0.003 A each.")
+        self.sweep_note.setProperty("muted", True)
+        self.sweep_note.setWordWrap(True)
+        grid.addWidget(self.sweep_note, len(fields) + 2, 0, 1, 2)
         return self.sweep_group
 
     def _feedback_card(self) -> QtWidgets.QWidget:
         group, grid = self._group_grid("Gate bounds and reference feedback")
+        self.feedback_group = group
         defaults = RunConfig()
         self.gate_min = spin(-3, 3, defaults.gate_min_v, 0.1, 4, " V")
         self.gate_max = spin(-3, 3, defaults.gate_max_v, 0.1, 4, " V")
@@ -289,12 +312,12 @@ class OECTWindow(QtWidgets.QMainWindow):
             for column, (caption, control) in enumerate(pair):
                 grid.addWidget(self._row_field(QtWidgets.QLabel(caption), control), row, column)
         grid.addWidget(self._row_field(QtWidgets.QLabel("Direction"), self.polarity), 3, 0, 1, 2)
-        note = QtWidgets.QLabel(
+        self.feedback_note = QtWidgets.QLabel(
             "Eref = Vref = V(reference) − V(source). The gate adjusts to follow the Eref target."
         )
-        note.setProperty("muted", True)
-        note.setWordWrap(True)
-        grid.addWidget(note, 4, 0, 1, 2)
+        self.feedback_note.setProperty("muted", True)
+        self.feedback_note.setWordWrap(True)
+        grid.addWidget(self.feedback_note, 4, 0, 1, 2)
         self.feedback_controls = (self.gate_initial, self.correction_factor, self.max_step, self.tolerance, self.polarity)
         return group
 
@@ -319,15 +342,16 @@ class OECTWindow(QtWidgets.QMainWindow):
         progress_row.addStretch(1)
         progress_row.addWidget(self.progress_detail)
         grid.addLayout(progress_row, 1, 0, 1, 2)
-        note = QtWidgets.QLabel("Text file: Time, GateI, GateV, DrainI, DrainV, Vref.")
-        note.setProperty("muted", True)
-        note.setWordWrap(True)
-        grid.addWidget(note, 2, 0, 1, 2)
+        self.output_note = QtWidgets.QLabel("Text file: Time, GateI, GateV, DrainI, DrainV, Vref.")
+        self.output_note.setProperty("muted", True)
+        self.output_note.setWordWrap(True)
+        grid.addWidget(self.output_note, 2, 0, 1, 2)
         return group
 
     def _plot_panel(self) -> QtWidgets.QWidget:
         panel = QtWidgets.QWidget()
         grid = QtWidgets.QGridLayout(panel)
+        self.plot_grid = grid
         grid.setContentsMargins(0, 0, 0, 0)
         grid.setSpacing(10)
         self.plots: dict[str, pg.PlotWidget] = {}
@@ -358,7 +382,7 @@ class OECTWindow(QtWidgets.QMainWindow):
             plot.setClipToView(True)
             self.plots[key] = plot
             if key == "vref":
-                plot.addLegend(offset=(12, 10))
+                self.vref_legend = plot.addLegend(offset=(12, 10))
             self.curves[key] = plot.plot(
                 pen=pg.mkPen(color, width=2),
                 connect="finite",
@@ -446,16 +470,86 @@ class OECTWindow(QtWidgets.QMainWindow):
         )
 
     def _simulation_changed(self, checked: bool) -> None:
-        for widget in (self.smu_ip, self.dmm_ip, self.test_button):
-            widget.setEnabled(not checked and self.worker is None)
+        self._refresh_mode_ui()
         self.mode_badge.setText("SIMULATION" if checked else "LIVE INSTRUMENT")
         self.mode_badge.setStyleSheet(
             "background: #DDF6F0; color: #075E57;" if checked else
             "background: #FFF0D9; color: #785318;"
         )
-        self.status_label.setText(
-            "Ready • simulation mode" if checked else "Ready • verify reference wiring and gate direction"
+        if checked:
+            message = "Ready • simulation mode"
+        elif self.reference_mode.currentData() == "feedback":
+            message = "Ready • verify reference wiring and gate direction"
+        elif self.reference_mode.currentData() == "monitor":
+            message = "Ready • DMM monitors Vref; Vg follows the sweep"
+        else:
+            message = "Ready • 2634B only; no DMM required"
+        self.status_label.setText(message)
+
+    def _reference_mode_changed(self, _index: int) -> None:
+        self._simulation_changed(self.simulation.isChecked())
+
+    def _sweep_mode_changed(self, _index: int) -> None:
+        self._refresh_mode_ui()
+
+    def _refresh_mode_ui(self) -> None:
+        reference_mode = self.reference_mode.currentData()
+        sweep_mode = self.sweep_mode.currentData()
+        busy = self.worker is not None or self.connection_worker is not None
+        idle = not busy
+        live = idle and not self.simulation.isChecked()
+        has_dmm = reference_mode != "none"
+        feedback = reference_mode == "feedback"
+
+        self.simulation.setEnabled(idle)
+        self.reference_mode.setEnabled(idle)
+        self.sweep_mode.setEnabled(idle)
+        self.smu_ip.setEnabled(live)
+        self.dmm_ip.setEnabled(live and has_dmm)
+        self.dmm_ip_label.setEnabled(has_dmm)
+        self.test_button.setEnabled(live)
+        self.test_button.setText("Test both connections" if has_dmm else "Test 2634B connection")
+        self.visa_note.setText(
+            "VISA LAN: TCPIP0::IP::inst0::INSTR for both instruments" if has_dmm else
+            "2634B VISA LAN: TCPIP0::IP::inst0::INSTR"
         )
+        self.reference_wiring_note.setVisible(has_dmm)
+        self.subtitle.setText(
+            "Keithley 2634B • smua drain / smub gate  |  DMM6500 • Reference voltage" if has_dmm else
+            "Keithley 2634B • smua drain / smub gate  |  no DMM"
+        )
+        self.sweep_group.setTitle("Target Eref sweep" if feedback else "Gate voltage sweep")
+        for label, text in (
+            (self.start_label, "Eref initial" if feedback else "Vg initial"),
+            (self.stop_label, "Eref final" if feedback else "Vg final"),
+            (self.step_label, "Eref step" if feedback else "Vg step"),
+        ):
+            label.setText(text)
+        self.final_keep.setEnabled(idle and sweep_mode == "staircase")
+        self.cycle_count.setEnabled(idle and sweep_mode == "cycles")
+        self.sweep_note.setText(
+            "Delay is inside each period. Drain and gate current limits: 0.003 A each." if sweep_mode == "staircase" else
+            "Each cycle sweeps initial → final → initial. No final keep. Current limits: 0.003 A each."
+        )
+        self.feedback_group.setTitle("Gate bounds and reference feedback" if feedback else "Gate bounds")
+        for widget in self.feedback_controls:
+            widget.setEnabled(idle and feedback)
+        self.feedback_note.setText(
+            "Eref = Vref = V(reference) − V(source). The gate adjusts to follow the Eref target." if feedback else
+            "Vg follows the programmed sweep; the DMM records Vref without changing Vg." if has_dmm else
+            "Vg follows the programmed sweep. No DMM connection or Vref reading is used."
+        )
+        self.output_note.setText(
+            "Text file: Time, GateI, GateV, DrainI, DrainV, Vref. Vref is blank without a DMM." if not has_dmm else
+            "Text file: Time, GateI, GateV, DrainI, DrainV, Vref."
+        )
+        self.plots["vref"].setVisible(has_dmm)
+        self.plot_grid.setRowStretch(2, 1 if has_dmm else 0)
+        self.plots["vref"].setLabel(
+            "left", "Vref / Eref" if feedback else "Vref", units="V", color="#526378"
+        )
+        self.curves["target_ref"].setVisible(feedback)
+        self.vref_legend.setVisible(feedback)
 
     def _browse_output(self) -> None:
         value = self.output.text().strip()
@@ -473,6 +567,9 @@ class OECTWindow(QtWidgets.QMainWindow):
             simulation=self.simulation.isChecked(),
             smu_ip=self.smu_ip.text().strip(),
             dmm_ip=self.dmm_ip.text().strip(),
+            reference_mode=self.reference_mode.currentData(),
+            sweep_mode=self.sweep_mode.currentData(),
+            cycle_count=self.cycle_count.value(),
             vds_v=self.vds.value(),
             sweep_start_v=self.sweep_start.value(),
             sweep_stop_v=self.sweep_stop.value(),
@@ -522,6 +619,8 @@ class OECTWindow(QtWidgets.QMainWindow):
                 return
         self._clear_plots()
         self._duration_s = config.duration_s
+        self._active_reference_mode = config.reference_mode
+        self._active_sweep_mode = config.sweep_mode
         self._last_result = None
         self.worker = AcquisitionWorker(config, self)
         self.worker.sample_ready.connect(self._on_sample)
@@ -530,9 +629,11 @@ class OECTWindow(QtWidgets.QMainWindow):
         self.worker.finished.connect(self._on_worker_finished)
         self._set_running(True)
         self.status_dot.setStyleSheet("color: #0D9D93;")
-        self.status_label.setText(
-            f"Starting • {len(config.levels)} levels • estimated {config.duration_s:g} s"
-        )
+        if config.sweep_mode == "cycles":
+            sequence = f"{config.cycle_count} cycles • {len(config.levels)} stages"
+        else:
+            sequence = f"{len(config.levels)} levels"
+        self.status_label.setText(f"Starting • {sequence} • estimated {config.duration_s:g} s")
         self.worker.start()
 
     def _stop(self) -> None:
@@ -547,19 +648,26 @@ class OECTWindow(QtWidgets.QMainWindow):
         data["time"].append(sample.elapsed_s)
         data["id"].append(sample.drain_i_a)
         data["vg"].append(sample.gate_v)
-        data["vref"].append(sample.vref_v)
-        data["target_ref"].append(sample.target_v)
         self.curves["id"].setData(data["time"], data["id"])
         self.curves["vg"].setData(data["time"], data["vg"], stepMode="right")
-        self.curves["vref"].setData(data["time"], data["vref"])
-        self.curves["target_ref"].setData(data["time"], data["target_ref"], stepMode="right")
+        if sample.vref_v is not None:
+            data["vref"].append(sample.vref_v)
+            self.curves["vref"].setData(data["time"], data["vref"])
+        if self._active_reference_mode == "feedback":
+            data["target_ref"].append(sample.target_v)
+            self.curves["target_ref"].setData(data["time"], data["target_ref"], stepMode="right")
         self._sample_count += 1
         self.sample_label.setText(f"{self._sample_count} samples")
         self.progress.setValue(min(99, max(0, int(100 * sample.elapsed_s / self._duration_s))))
-        self.progress_detail.setText(f"Level {sample.stage_index} • {sample.phase}")
-        self.status_label.setText(
-            f"Vref / Eref {sample.vref_v:+.4g} V  •  target {sample.target_v:+.4g} V"
-        )
+        cycle = f"Cycle {sample.cycle_index} • " if self._active_sweep_mode == "cycles" else ""
+        self.progress_detail.setText(f"{cycle}Level {sample.stage_index} • {sample.phase}")
+        if self._active_reference_mode == "feedback":
+            message = f"Vref / Eref {sample.vref_v:+.4g} V  •  target {sample.target_v:+.4g} V"
+        elif self._active_reference_mode == "monitor":
+            message = f"Vg target {sample.target_v:+.4g} V  •  Vref {sample.vref_v:+.4g} V"
+        else:
+            message = f"Vg target {sample.target_v:+.4g} V  •  no reference"
+        self.status_label.setText(message)
 
     @QtCore.pyqtSlot(str)
     def _on_status(self, message: str) -> None:
@@ -589,34 +697,35 @@ class OECTWindow(QtWidgets.QMainWindow):
     def _set_running(self, running: bool) -> None:
         self.start_button.setEnabled(not running)
         self.stop_button.setEnabled(running)
-        self.simulation.setEnabled(not running)
         for widget in (
             self.vds, self.sweep_start, self.sweep_stop, self.sweep_step,
-            self.hold, self.delay, self.final_keep, self.interval,
+            self.hold, self.delay, self.interval,
             self.gate_min, self.gate_max,
             self.output, self.browse_button,
         ):
             widget.setEnabled(not running)
-        for widget in self.feedback_controls:
-            widget.setEnabled(not running)
-        live_editable = not running and not self.simulation.isChecked()
-        for widget in (self.smu_ip, self.dmm_ip, self.test_button):
-            widget.setEnabled(live_editable)
+        self._refresh_mode_ui()
 
     def _test_connections(self) -> None:
         if self.connection_worker is not None or self.worker is not None:
             return
         smu_host = self.smu_ip.text().strip()
-        dmm_host = self.dmm_ip.text().strip()
-        if not smu_host or not dmm_host:
-            QtWidgets.QMessageBox.warning(self, "Connection test", "Enter both instrument IP addresses")
+        has_dmm = self.reference_mode.currentData() != "none"
+        dmm_host = self.dmm_ip.text().strip() if has_dmm else None
+        if not smu_host or (has_dmm and not dmm_host):
+            detail = "both instrument IP addresses" if has_dmm else "the 2634B IP address"
+            QtWidgets.QMessageBox.warning(self, "Connection test", f"Enter {detail}")
             return
         self.test_button.setEnabled(False)
         self.start_button.setEnabled(False)
-        self.status_label.setText("Testing read-only VISA connections to 2634B and DMM6500…")
+        self.status_label.setText(
+            "Testing read-only VISA connections to 2634B and DMM6500…" if has_dmm else
+            "Testing read-only VISA connection to 2634B…"
+        )
         self.connection_worker = ConnectionWorker(smu_host, dmm_host, self)
         self.connection_worker.probe_complete.connect(self._on_probe_complete)
         self.connection_worker.finished.connect(self._on_probe_finished)
+        self._refresh_mode_ui()
         self.connection_worker.start()
 
     @QtCore.pyqtSlot(bool, str)
@@ -630,7 +739,7 @@ class OECTWindow(QtWidgets.QMainWindow):
     def _on_probe_finished(self) -> None:
         self.connection_worker = None
         self.start_button.setEnabled(self.worker is None)
-        self.test_button.setEnabled(self.worker is None and not self.simulation.isChecked())
+        self._refresh_mode_ui()
         if self._pending_close and self.worker is None:
             QtCore.QTimer.singleShot(0, self.close)
 

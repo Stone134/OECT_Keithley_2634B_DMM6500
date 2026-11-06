@@ -23,6 +23,8 @@ class FakeSMU:
         self.shutdown_calls = 0
         self.shutdown_error = shutdown_error
         self.configure_args: tuple[object, ...] = ()
+        self.gate_commands: list[float] = []
+        self.read_calls = 0
 
     def connect(self) -> str:
         self.connected = True
@@ -36,9 +38,11 @@ class FakeSMU:
         self.started = True
 
     def read_next(self, timeout_s: float, stop_event: threading.Event | None = None) -> SMUSample:
+        self.read_calls += 1
         return SMUSample(1, -1e-6, 1e-9, 0.1, 0)
 
     def set_gate(self, voltage_v: float) -> float:
+        self.gate_commands.append(voltage_v)
         return voltage_v
 
     def shutdown(self) -> None:
@@ -72,6 +76,28 @@ class FakeDMM:
 
 
 class RunnerTests(unittest.TestCase):
+    def test_cycle_levels_duration_and_open_loop_validation(self) -> None:
+        config = RunConfig(
+            reference_mode="none", dmm_ip="", sweep_mode="cycles", cycle_count=2,
+            sweep_start_v=0, sweep_stop_v=-0.2, sweep_step_v=-0.1,
+            hold_s=10, final_keep_s=3600,
+        )
+        config.validate()
+        self.assertEqual(config.levels, (0, -0.1, -0.2, -0.1, 0, -0.1, -0.2, -0.1, 0))
+        self.assertEqual(config.duration_s, 90)
+        self.assertEqual([config.cycle_for_stage(i) for i in range(1, 10)],
+                         [1, 1, 1, 1, 1, 2, 2, 2, 2])
+        with self.assertRaisesRegex(ValueError, "different initial and final"):
+            RunConfig(reference_mode="none", sweep_mode="cycles",
+                      sweep_start_v=0, sweep_stop_v=0).validate()
+        with self.assertRaisesRegex(ValueError, "inside the gate bounds"):
+            RunConfig(reference_mode="monitor", sweep_start_v=0,
+                      sweep_stop_v=-2, sweep_step_v=-0.1).validate()
+        with self.assertRaisesRegex(ValueError, "Cycle count"):
+            RunConfig(sweep_mode="cycles", cycle_count=0).validate()
+        with self.assertRaisesRegex(ValueError, "IP addresses"):
+            RunConfig(reference_mode="monitor", dmm_ip="").validate()
+
     def test_config_defaults_and_feedback_bounds(self) -> None:
         config = RunConfig()
         self.assertEqual((config.smu_ip, config.dmm_ip), ("192.168.1.150", "192.168.1.160"))
@@ -130,6 +156,102 @@ class RunnerTests(unittest.TestCase):
             self.assertFalse(smu.started)
             self.assertTrue(dmm.closed)
             self.assertFalse(config.output_path.exists())
+
+    def test_monitor_sweeps_gate_and_records_vref_without_feedback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "monitor.txt"
+            config = RunConfig(
+                reference_mode="monitor", sweep_start_v=0, sweep_stop_v=-0.1,
+                sweep_step_v=-0.1, hold_s=0.2, delay_s=0, final_keep_s=0,
+                sample_interval_s=0.1, output_file=str(path),
+            )
+            samples = []
+            with patch.object(runner, "next_feedback_gate", side_effect=AssertionError("feedback called")):
+                runner.run_experiment(config, on_sample=samples.append)
+            self.assertEqual({sample.stage_index for sample in samples}, {1, 2})
+            self.assertEqual({sample.gate_v for sample in samples if sample.stage_index == 1}, {0})
+            self.assertEqual({sample.gate_v for sample in samples if sample.stage_index == 2}, {-0.1})
+            self.assertTrue(all(sample.vref_v is not None for sample in samples))
+            self.assertTrue(all(sample.within_tolerance is None for sample in samples))
+            with path.open(newline="", encoding="utf-8") as stream:
+                self.assertTrue(all(row["Vref"] for row in csv.DictReader(stream, delimiter="\t")))
+
+    def test_no_reference_live_path_never_creates_dmm_and_writes_blank_vref(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "no_reference.txt"
+            config = RunConfig(
+                simulation=False, reference_mode="none", dmm_ip="",
+                sweep_start_v=-0.2, sweep_stop_v=-0.2,
+                output_file=str(path),
+            )
+            smu = FakeSMU()
+            stop = threading.Event()
+            with patch.object(runner, "Keithley2634B", return_value=smu), patch.object(
+                runner, "DMM6500", side_effect=AssertionError("DMM constructed")
+            ), patch.object(runner, "next_feedback_gate", side_effect=AssertionError("feedback called")):
+                result = runner.run_experiment(config, on_sample=lambda _: stop.set(), stop_event=stop)
+            self.assertEqual(result.samples, 1)
+            self.assertEqual(smu.configure_args[1], -0.2)
+            self.assertEqual(smu.gate_commands, [])
+            self.assertEqual(smu.shutdown_calls, 1)
+            with path.open(newline="", encoding="utf-8") as stream:
+                rows = list(csv.DictReader(stream, delimiter="\t"))
+            self.assertEqual(rows[0]["Vref"], "")
+
+    def test_stop_during_dmm_read_does_not_issue_feedback_command(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            stop = threading.Event()
+            smu = FakeSMU()
+
+            class StopAfterDMM(FakeDMM):
+                def read_vref(self) -> float:
+                    stop.set()
+                    return -0.1
+
+            dmm = StopAfterDMM()
+            config = RunConfig(simulation=False, output_file=str(Path(directory) / "stop.txt"))
+            with patch.object(runner, "Keithley2634B", return_value=smu), patch.object(
+                runner, "DMM6500", return_value=dmm
+            ):
+                result = runner.run_experiment(config, stop_event=stop)
+            self.assertTrue(result.stopped)
+            self.assertEqual(result.samples, 0)
+            self.assertEqual(smu.gate_commands, [])
+            self.assertEqual(smu.shutdown_calls, 1)
+
+    def test_cyclic_sweep_commands_levels_without_final_keep(self) -> None:
+        for reference_mode in ("feedback", "monitor", "none"):
+            with self.subTest(reference_mode=reference_mode), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "cycles.txt"
+                config = RunConfig(
+                    reference_mode=reference_mode, sweep_mode="cycles", cycle_count=2,
+                    sweep_start_v=0, sweep_stop_v=-0.1, sweep_step_v=-0.1,
+                    hold_s=0.1, delay_s=0, final_keep_s=3600,
+                    sample_interval_s=0.1, output_file=str(path),
+                )
+                samples = []
+                result = runner.run_experiment(config, on_sample=samples.append)
+                self.assertFalse(result.stopped)
+                self.assertEqual({sample.stage_index for sample in samples}, set(range(1, 5 + 1)))
+                self.assertEqual({sample.cycle_index for sample in samples}, {1, 2})
+                self.assertTrue(all(sample.phase != "final_keep" for sample in samples))
+                if reference_mode != "feedback":
+                    stage_values = [next(sample.gate_v for sample in samples
+                                         if sample.stage_index == i) for i in range(1, 6)]
+                    self.assertEqual(stage_values, list(config.levels))
+
+    def test_staircase_keeps_final_level(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = RunConfig(
+                reference_mode="none", sweep_start_v=0, sweep_stop_v=0,
+                hold_s=0.1, delay_s=0, final_keep_s=0.2,
+                sample_interval_s=0.1,
+                output_file=str(Path(directory) / "keep.txt"),
+            )
+            self.assertAlmostEqual(config.duration_s, 0.3)
+            samples = []
+            runner.run_experiment(config, on_sample=samples.append)
+            self.assertIn("final_keep", {sample.phase for sample in samples})
 
     def test_live_path_passes_current_limits_and_stops_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
